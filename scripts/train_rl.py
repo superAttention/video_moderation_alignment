@@ -6,11 +6,12 @@ load_dotenv()
 
 from configs.rl_config import RLConfig
 from client import create_training_client, get_sampling_client
-from data.rl_dataset import RLDataset
+from data.prompt_dataset import PromptDataset
 from trainers.rl_trainer import RLTrainer
 
-# TODO: import your concrete Env subclass here
-# from envs.my_task_env import MyTaskEnv
+# Compose your reward functions here — they are summed at runtime
+# from rewards.base import ExactMatchReward, LLMJudgeReward
+reward_fns = []  # e.g. [ExactMatchReward(references), LLMJudgeReward(...)]
 
 
 async def main():
@@ -19,17 +20,15 @@ async def main():
     training_client = create_training_client(config.model_name, config.lora_rank)
     sampling_client = get_sampling_client(training_client)
 
-    # TODO: load prompts and plug in your Env subclass
-    prompts: list[str] = []
-    env_cls = None  # replace with MyTaskEnv
-
-    rl_dataset = RLDataset(prompts, env_cls, num_generations=config.num_generations)
+    tokenizer = training_client.get_tokenizer()
+    prompt_dataset = PromptDataset(config.prompt_data_path, tokenizer, config.max_prompt_len)
 
     trainer = RLTrainer(
         training_client=training_client,
         sampling_client=sampling_client,
         config=config,
-        rl_dataset=rl_dataset,
+        prompt_dataset=prompt_dataset,
+        reward_fns=reward_fns,
     )
     await trainer.train()
 

@@ -1,3 +1,3 @@
-from .reward_fn import RewardFn
+from .base import RewardFn
 
 __all__ = ["RewardFn"]

@@ -1,19 +1,22 @@
 """
 RL trainer using Tinker's TrainingClient + SamplingClient.
 
-Tinker handles: weight storage, forward/backward, AdamW, text generation.
-You implement: rollout orchestration, advantage computation, loss assembly, reward integration.
+Follows TRL/veRL convention: reward_fns is a list of callables passed at
+construction time. The trainer calls each fn on every batch of completions
+and sums the scores, making rewards composable without coupling them to
+data or environment classes.
 
 Per-step loop:
-  1. rollout    — sample G completions per prompt via SamplingClient
-  2. reward     — score completions via EnvGroup.step()
-  3. advantages — normalize rewards within each group (GRPO) or compute GAE (PPO)
-  4. assemble   — convert trajectories to types.Datum with log-prob weights
+  1. rollout    — generate num_generations completions per prompt (SamplingClient)
+  2. reward     — call each reward_fn, sum scores across fns
+  3. advantages — normalize within group (GRPO) or compute GAE (PPO)
+  4. assemble   — convert to types.Datum with importance-sampled weights
   5. update     — forward_backward_async → optim_step_async
 """
 from tinker import TrainingClient, SamplingClient, types
 from configs.rl_config import RLConfig
-from data.rl_dataset import RLDataset
+from data.prompt_dataset import PromptDataset
+from rewards import RewardFn
 from .base_trainer import BaseTrainer
 
 
@@ -24,20 +27,44 @@ class RLTrainer(BaseTrainer):
         training_client: TrainingClient,
         sampling_client: SamplingClient,
         config: RLConfig,
-        rl_dataset: RLDataset,
+        prompt_dataset: PromptDataset,
+        reward_fns: list[RewardFn],     # composable, summed at runtime
     ):
         super().__init__(training_client, config)
         self.sc = sampling_client
-        self.rl_dataset = rl_dataset
+        self.prompt_dataset = prompt_dataset
+        self.reward_fns = reward_fns
 
     # ------------------------------------------------------------------
     # Rollout
     # ------------------------------------------------------------------
 
-    async def rollout(self, env_group) -> list[dict]:
+    async def rollout(self, prompts: list[str]) -> dict:
         """
-        Sample G completions for the group's prompt.
-        Returns list of {"completion": str, "reward": float, "log_probs": ...}.
+        Generate num_generations completions per prompt via SamplingClient.
+
+        Returns:
+            {
+                "prompts":      list[str]       shape (B,)
+                "completions":  list[list[str]] shape (B, G)
+                "log_probs":    ...             shape (B, G, T)
+            }
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Reward scoring
+    # ------------------------------------------------------------------
+
+    def score(self, prompts: list[str], completions: list[list[str]]) -> list[list[float]]:
+        """
+        Call each reward_fn on every (prompt, completion) pair and sum scores.
+
+        Args:
+            prompts:     (B,)
+            completions: (B, G)
+        Returns:
+            rewards: (B, G) — sum of all reward_fn outputs
         """
         raise NotImplementedError
 
@@ -45,11 +72,15 @@ class RLTrainer(BaseTrainer):
     # Advantage computation
     # ------------------------------------------------------------------
 
-    def compute_advantages(self, rewards: list[float]) -> list[float]:
+    def compute_advantages(self, rewards: list[list[float]]) -> list[list[float]]:
         """
-        Convert raw rewards to advantages.
-        GRPO: normalize within group (subtract mean, divide by std).
+        GRPO: subtract group mean, divide by group std (per prompt).
         PPO:  GAE over the trajectory.
+
+        Args:
+            rewards: (B, G)
+        Returns:
+            advantages: (B, G)
         """
         raise NotImplementedError
 
@@ -59,13 +90,13 @@ class RLTrainer(BaseTrainer):
 
     def assemble_training_data(
         self,
-        rollout_results: list[dict],
-        advantages: list[float],
+        rollout: dict,
+        advantages: list[list[float]],
     ) -> list[types.Datum]:
         """
-        Convert rollout results + advantages into types.Datum objects
-        for forward_backward_async.
-        Uses importance_sampling or PPO loss depending on config.algorithm.
+        Convert rollout + advantages into types.Datum objects for
+        forward_backward_async. Uses importance_sampling or PPO loss
+        depending on config.algorithm.
         """
         raise NotImplementedError
 
@@ -74,13 +105,20 @@ class RLTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     async def train(self) -> None:
-        """
-        Main RL loop over rl_dataset:
-          for each env_group:
-            results   = await self.rollout(env_group)
-            advantages = self.compute_advantages([r["reward"] for r in results])
-            data      = self.assemble_training_data(results, advantages)
-            await tc.forward_backward_async(data=data, loss_fn=...)
-            await tc.optim_step_async(types.AdamParams(learning_rate=config.learning_rate))
-        """
-        raise NotImplementedError
+        for step, batch in enumerate(self.prompt_dataset.batches(1)):
+            rollout = await self.rollout(batch["prompts"])
+            rewards = self.score(rollout["prompts"], rollout["completions"])
+            advantages = self.compute_advantages(rewards)
+            data = self.assemble_training_data(rollout, advantages)
+
+            await self.tc.forward_backward_async(data=data, loss_fn=self.config.algorithm)
+            await self.tc.optim_step_async(types.AdamParams(learning_rate=self.config.learning_rate))
+
+            self.global_step += 1
+            if self.global_step % self.config.log_every == 0:
+                flat_rewards = [r for group in rewards for r in group]
+                self.log({"reward_mean": sum(flat_rewards) / len(flat_rewards)})
+            if self.global_step % self.config.save_every == 0:
+                await self.save_checkpoint()
+            if self.global_step >= self.config.num_steps:
+                break

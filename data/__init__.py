@@ -1,4 +1,4 @@
 from .sft_dataset import SFTDataset
-from .rl_dataset import RLDataset, EnvGroup
+from .prompt_dataset import PromptDataset
 
-__all__ = ["SFTDataset", "RLDataset", "EnvGroup"]
+__all__ = ["SFTDataset", "PromptDataset"]

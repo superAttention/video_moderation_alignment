@@ -11,6 +11,9 @@ class RLConfig:
     # Maps to Tinker loss: "cross_entropy" (importance-sampled) or built-in PPO/CISPO loss
     algorithm: str = "grpo"
 
+    # Data
+    prompt_data_path: str = ""
+
     # Rollout
     num_generations: int = 8      # G in GRPO — completions sampled per prompt
     max_prompt_len: int = 256
@@ -32,5 +35,6 @@ class RLConfig:
 
     # Logging / checkpointing
     log_path: str = "~/logs/rl"
+    log_every: int = 10
     save_every: int = 50
     eval_every: int = 25
