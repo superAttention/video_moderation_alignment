@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class SFTConfig:
     # Tinker model identifier (see https://tinker-docs.thinkingmachines.ai/tinker/models/)
-    model_name: str = "Qwen/Qwen3-8B"
+    model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     lora_rank: int = 32
 
     # Loss function — "cross_entropy" | "importance_sampling" | "custom"

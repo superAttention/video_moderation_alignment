@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class RLConfig:
     # Tinker model identifier (see https://tinker-docs.thinkingmachines.ai/tinker/models/)
-    model_name: str = "Qwen/Qwen3-8B"
+    model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     lora_rank: int = 32
 
     # RL algorithm — "grpo" | "ppo" | "cispo"

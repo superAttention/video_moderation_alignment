@@ -66,7 +66,9 @@ class RLTrainer(BaseTrainer):
         Returns:
             rewards: (B, G) — sum of all reward_fn outputs
         """
-        raise NotImplementedError
+
+        return sum(self.reward_fns(prompts, completions))
+
 
     # ------------------------------------------------------------------
     # Advantage computation
