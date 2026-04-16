@@ -12,8 +12,8 @@ class SFTConfig:
 
     # Data
     categories: tuple = ("1_Violent_Crimes", "10_Hate", "12_Sexual_Content")
-    train_data_path: str = ""
-    val_data_path: str = ""
+    train_data_path: str = "data/train.jsonl"
+    val_data_path: str = "data/val.jsonl"
     max_seq_len: int = 512
 
     # Optimization (Tinker uses AdamW internally via types.AdamParams)

@@ -13,6 +13,8 @@ Input JSONL format (one example per line):
         "rejected": "To beat a cat for obedience..."
     }
 """
+import json
+import numpy as np
 from tinker import types
 from .video_utils import extract_frames
 
@@ -28,28 +30,68 @@ class PreferenceDataset:
         }
 
     Loss masking: weights=0 on (video + question) tokens, weights=1 on response tokens.
+    Frames are extracted once per example and shared between chosen/rejected.
     """
 
     def __init__(self, data_path: str, tokenizer, processor, max_seq_len: int, num_frames: int = 8):
-        """
-        Args:
-            data_path:  path to JSONL file produced by scripts/generate_responses.py
-            tokenizer:  from training_client.get_tokenizer()
-            processor:  Qwen3-VL processor for combining vision + text tokens
-            num_frames: number of frames to sample per video
-        """
-        raise NotImplementedError
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.max_seq_len = max_seq_len
+        self.num_frames = num_frames
+
+        with open(data_path) as f:
+            self.examples = [json.loads(line) for line in f]
 
     def __len__(self) -> int:
-        raise NotImplementedError
+        return len(self.examples)
+
+    def _make_datum(self, question: str, frames: list, response: str) -> types.Datum:
+        """Build one Datum given pre-extracted frames and a response string."""
+        prompt_inputs = self.processor(
+            text=question,
+            images=frames,
+            return_tensors="pt",
+        )
+        prompt_ids = prompt_inputs["input_ids"][0].tolist()
+
+        response_ids = self.tokenizer.encode(response, add_special_tokens=False)
+        eos_id = self.tokenizer.eos_token_id
+
+        full_ids = (prompt_ids + response_ids + [eos_id])[: self.max_seq_len + 1]
+        question_len = len(prompt_ids)
+        response_len = len(full_ids) - question_len
+
+        weights = [0] * (question_len - 1) + [1] * response_len
+        target_tokens = full_ids[1:]
+
+        return types.Datum(
+            model_input=types.ModelInput.from_ints(full_ids[:-1]),
+            loss_fn_inputs={
+                "target_tokens": np.array(target_tokens, dtype=np.int32),
+                "weights":       np.array(weights,       dtype=np.float32),
+            },
+        )
 
     def make_pair(self, question: str, video_path: str, chosen: str, rejected: str) -> dict:
         """
         Returns {"chosen": types.Datum, "rejected": types.Datum}.
-        Both share the same video frames and question tokens.
+        Frames are extracted once and shared.
         """
-        raise NotImplementedError
+        frames = extract_frames(video_path, self.num_frames)
+        return {
+            "chosen":   self._make_datum(question, frames, chosen),
+            "rejected": self._make_datum(question, frames, rejected),
+        }
 
     def batches(self, batch_size: int):
         """Yield dicts with keys: chosen (list[Datum]), rejected (list[Datum])."""
-        raise NotImplementedError
+        chosen_batch, rejected_batch = [], []
+        for ex in self.examples:
+            pair = self.make_pair(ex["question"], ex["video_path"], ex["chosen"], ex["rejected"])
+            chosen_batch.append(pair["chosen"])
+            rejected_batch.append(pair["rejected"])
+            if len(chosen_batch) == batch_size:
+                yield {"chosen": chosen_batch, "rejected": rejected_batch}
+                chosen_batch, rejected_batch = [], []
+        if chosen_batch:
+            yield {"chosen": chosen_batch, "rejected": rejected_batch}

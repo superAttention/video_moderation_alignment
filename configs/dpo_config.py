@@ -11,9 +11,10 @@ class DPOConfig:
     beta: float = 0.1       # KL penalty coefficient — higher = stay closer to reference
 
     # Data
-    train_data_path: str = ""
-    val_data_path: str = ""
+    train_data_path: str = "data/dpo_pairs.jsonl"
+    val_data_path: str = "data/val.jsonl"
     max_seq_len: int = 512
+    batch_size: int = 4
 
     # Optimization
     learning_rate: float = 5e-5

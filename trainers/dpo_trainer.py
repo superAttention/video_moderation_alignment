@@ -1,31 +1,22 @@
 """
-DPO trainer using Tinker's forward_backward_custom().
+DPO trainer using Tinker's forward_backward_custom_async().
 
-Unlike SFT (cross-entropy on one sequence) or RL (reward signal from rollouts),
-DPO computes loss from log prob ratios between policy and reference model
-on preference pairs — no sampling needed.
+Unlike SFT (cross-entropy on one sequence), DPO computes loss from log prob
+ratios between the policy and a frozen reference model on preference pairs.
 
 DPO loss (Rafailov et al. 2023):
     L = -E[ log σ( β * (log π(y_w|x) - log π_ref(y_w|x))
                      - β * (log π(y_l|x) - log π_ref(y_l|x)) ) ]
 
-Where:
-    y_w = chosen completion
-    y_l = rejected completion
-    π   = policy (model being trained)
-    π_ref = reference model (frozen)
-    β   = KL penalty coefficient (config.beta)
-"""
+How Tinker's forward_backward_custom_async works:
+    1. Does a forward pass → produces per-token logprobs for each Datum
+    2. Calls your loss_fn(data, logprobs_list) synchronously
+    3. Calls loss.backward() to get ∂loss/∂logprobs
+    4. Sends those gradients back to the server for the actual backward pass
 
+For the reference model we use the same API with a zero-gradient dummy loss
+to extract logprobs without updating weights.
 """
-Basically for a single prompt, in the dataset we have the good 
-good response and the bad response, we use the reference model and
-the current model to calculate the probability of getting the good response and the 
-bad response, by actively choosing the token that match the response
-and calculate the joint probability of getting that reponse.
-We try to maximise the difference between the probabilty of good response - the bad resopnse
-"""
-
 import torch
 import torch.nn.functional as F
 from tinker import TrainingClient, types
@@ -39,7 +30,7 @@ class DPOTrainer(BaseTrainer):
     def __init__(
         self,
         training_client: TrainingClient,
-        ref_client: TrainingClient,     # frozen reference model
+        ref_client: TrainingClient,     # frozen reference model — never call optim_step on this
         config: DPOConfig,
         train_dataset: PreferenceDataset,
         val_dataset: PreferenceDataset | None = None,
@@ -49,47 +40,78 @@ class DPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
-    async def get_log_probs(self, client: TrainingClient, data: list[types.Datum]) -> torch.Tensor:
+    async def _extract_ref_logps(
+        self, chosen: list[types.Datum], rejected: list[types.Datum]
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """
-        Run a forward pass (no grad) and return per-sequence log probs.
-        Uses client.forward() — not forward_backward().
-        Returns shape (B,).
-        """
+        Run a forward pass on the frozen reference model and return per-sequence
+        log probs for chosen and rejected.
 
+        We use forward_backward_custom_async with a dummy loss (gradient = 0) so
+        that no weights are updated on the reference model.
+        """
+        combined = chosen + rejected
+        B = len(chosen)
+        captured: list[torch.Tensor] = []
 
-    def dpo_loss(
-        self,
-        policy_chosen_logps: torch.Tensor,      # (B,)
-        policy_rejected_logps: torch.Tensor,    # (B,)
-        ref_chosen_logps: torch.Tensor,         # (B,)
-        ref_rejected_logps: torch.Tensor,       # (B,)
-    ) -> torch.Tensor:
-        """
-        Compute scalar DPO loss.
-        Implement the formula from the module docstring.
-        """
-        raise NotImplementedError
+        def extract_fn(data, logprobs_list):
+            for datum, logprob in zip(data, logprobs_list):
+                weights = torch.tensor(datum.loss_fn_inputs["weights"].data)
+                # sum weighted log probs → scalar log p(response | prompt)
+                captured.append((logprob * weights).sum().detach())
+            # Zero-gradient dummy loss: depends on all logprobs so grad is 0, not None
+            dummy_loss = sum(lp.sum() * 0.0 for lp in logprobs_list)
+            return dummy_loss, {}
+
+        # extract_fn is called synchronously inside the coroutine, so
+        # `captured` is populated by the time this line returns.
+        await self.ref.forward_backward_custom_async(combined, extract_fn)
+        return captured[:B], captured[B:]
 
     async def train(self) -> None:
-        for batch in self.train_dataset.batches(batch_size=8):
-            # Get log probs from policy and reference for both chosen and rejected
-            policy_chosen_logps   = await self.get_log_probs(self.tc,  batch["chosen"])
-            policy_rejected_logps = await self.get_log_probs(self.tc,  batch["rejected"])
-            ref_chosen_logps      = await self.get_log_probs(self.ref, batch["chosen"])
-            ref_rejected_logps    = await self.get_log_probs(self.ref, batch["rejected"])
+        adam_params = types.AdamParams(learning_rate=self.config.learning_rate)
 
-            loss = self.dpo_loss(
-                policy_chosen_logps,
-                policy_rejected_logps,
-                ref_chosen_logps,
-                ref_rejected_logps,
-            )
+        for epoch in range(self.config.num_epochs):
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
 
-            await self.tc.forward_backward_custom_async(loss=loss)
-            await self.tc.optim_step_async(types.AdamParams(learning_rate=self.config.learning_rate))
+            for batch in self.train_dataset.batches(self.config.batch_size):
+                chosen   = batch["chosen"]    # list[Datum], length B
+                rejected = batch["rejected"]  # list[Datum], length B
+                combined = chosen + rejected  # length 2B — policy processes all at once
 
-            self.global_step += 1
-            if self.global_step % self.config.log_every == 0:
-                self.log({"loss": loss.item()})
-            if self.global_step % self.config.save_every == 0:
-                await self.save_checkpoint()
+                # Step 1: reference model log probs (no gradient, no weight update)
+                ref_chosen_logps, ref_rejected_logps = await self._extract_ref_logps(chosen, rejected)
+
+                ref_chosen   = torch.stack(ref_chosen_logps)    # (B,)
+                ref_rejected = torch.stack(ref_rejected_logps)  # (B,)
+
+                # Step 2: policy forward + backward with DPO loss
+                def dpo_loss_fn(data, logprobs_list):
+                    B = len(data) // 2
+
+                    # Aggregate token-level logprobs → per-sequence log probs
+                    def seq_logp(datum, logprob):
+                        weights = torch.tensor(datum.loss_fn_inputs["weights"].data)
+                        return (logprob * weights).sum()
+
+                    policy_chosen   = torch.stack([seq_logp(data[i],   logprobs_list[i])   for i in range(B)])
+                    policy_rejected = torch.stack([seq_logp(data[i+B], logprobs_list[i+B]) for i in range(B)])
+
+                    # Log-ratio: how much did the policy change relative to reference?
+                    chosen_ratio   = policy_chosen   - ref_chosen    # (B,)
+                    rejected_ratio = policy_rejected - ref_rejected   # (B,)
+
+                    loss = -F.logsigmoid(self.config.beta * (chosen_ratio - rejected_ratio)).mean()
+
+                    return loss, {"dpo_loss": loss.item()}
+
+                output = await self.tc.forward_backward_custom_async(combined, dpo_loss_fn)
+                await self.tc.optim_step_async(adam_params)
+
+                self.global_step += 1
+                if self.global_step % self.config.log_every == 0:
+                    self.log(output.metrics)
+                if self.global_step % self.config.save_every == 0:
+                    await self.save_checkpoint()
+
+        await self.save_checkpoint(tag="final")
