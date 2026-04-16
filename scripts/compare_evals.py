@@ -30,6 +30,12 @@ METRICS = [
     ("avg_rationale_score", "rationale",    "{:.2f}"),
 ]
 
+# Derived metric: only meaningful on the benign split
+# over_refusal_rate = 1 - benign_action_accuracy
+BENIGN_DERIVED = [
+    ("over_refusal_rate", "over_refusal", "{:.1%}"),
+]
+
 
 def load_results(checkpoints: list[str]) -> dict[str, dict]:
     loaded = {}
@@ -83,6 +89,18 @@ def print_table(
             value = split_data.get("overall", {}).get(key)
             row += f"{fmt(value, fmt_str):>{col_w}}"
         emit(row)
+
+    if split == "benign":
+        for key, label, fmt_str in BENIGN_DERIVED:
+            row = f"  {label:<22}"
+            for ck in checkpoints:
+                if ck not in results:
+                    row += f"{'—':>{col_w}}"
+                    continue
+                action_acc = results[ck].get(split, {}).get("overall", {}).get("action_accuracy")
+                value = 1.0 - action_acc if action_acc is not None else None
+                row += f"{fmt(value, fmt_str):>{col_w}}"
+            emit(row)
 
     # Per-category breakdown for action_accuracy
     emit("")
