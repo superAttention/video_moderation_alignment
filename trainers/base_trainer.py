@@ -30,5 +30,8 @@ class BaseTrainer(ABC):
         await self.tc.save_state(name=name)
 
     def log(self, metrics: dict) -> None:
-        parts = [f"step={self.global_step}"] + [f"{k}={v:.4f}" for k, v in metrics.items()]
-        print(" | ".join(parts))
+        loss = metrics.get("loss:sum", metrics.get("loss", None))
+        loss_str = f"loss={loss:.4f}" if loss is not None else ""
+        extras = {k: v for k, v in metrics.items() if k not in ("loss:sum", "loss")}
+        parts = [f"step={self.global_step}", loss_str] + [f"{k}={v:.4f}" for k, v in extras.items()]
+        print(" | ".join(p for p in parts if p))

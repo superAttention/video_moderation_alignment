@@ -1,5 +1,5 @@
 from .base_trainer import BaseTrainer
 from .sft_trainer import SFTTrainer
-from .rl_trainer import RLTrainer
+from .dpo_trainer import DPOTrainer
 
-__all__ = ["BaseTrainer", "SFTTrainer", "RLTrainer"]
+__all__ = ["BaseTrainer", "SFTTrainer", "DPOTrainer"]

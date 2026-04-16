@@ -16,7 +16,7 @@ Input JSONL format (one example per line):
 import json
 import numpy as np
 from tinker import types
-from .video_utils import extract_frames
+from .video_utils import extract_frames, resolve_path
 
 
 class PreferenceDataset:
@@ -77,7 +77,7 @@ class PreferenceDataset:
         Returns {"chosen": types.Datum, "rejected": types.Datum}.
         Frames are extracted once and shared.
         """
-        frames = extract_frames(video_path, self.num_frames)
+        frames = extract_frames(resolve_path(video_path), self.num_frames)
         return {
             "chosen":   self._make_datum(question, frames, chosen),
             "rejected": self._make_datum(question, frames, rejected),

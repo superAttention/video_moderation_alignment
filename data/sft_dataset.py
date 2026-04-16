@@ -15,7 +15,7 @@ Input JSONL format (one example per line):
 import json
 import numpy as np
 from tinker import types
-from .video_utils import extract_frames
+from .video_utils import extract_frames, resolve_path
 
 
 class SFTDataset:
@@ -60,7 +60,7 @@ class SFTDataset:
           4. Compute token weights 
           5. Return Datum with model_input=full_ids[:-1], target_tokens=full_ids[1:]
         """
-        frames = extract_frames(video_path, self.num_frames)
+        frames = extract_frames(resolve_path(video_path), self.num_frames)
 
         # Step 1: tokenize the question (with video frames) to get prompt token IDs
         prompt_inputs = self.processor(

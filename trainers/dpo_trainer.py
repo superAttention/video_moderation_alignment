@@ -65,7 +65,7 @@ class DPOTrainer(BaseTrainer):
 
         # extract_fn is called synchronously inside the coroutine, so
         # `captured` is populated by the time this line returns.
-        await self.ref.forward_backward_custom_async(combined, extract_fn)
+        await self.ref.forward_backward_custom(combined, extract_fn)
         return captured[:B], captured[B:]
 
     async def train(self) -> None:
@@ -105,8 +105,8 @@ class DPOTrainer(BaseTrainer):
 
                     return loss, {"dpo_loss": loss.item()}
 
-                output = await self.tc.forward_backward_custom_async(combined, dpo_loss_fn)
-                await self.tc.optim_step_async(adam_params)
+                output = await self.tc.forward_backward_custom(combined, dpo_loss_fn)
+                await self.tc.optim_step(adam_params)
 
                 self.global_step += 1
                 if self.global_step % self.config.log_every == 0:
