@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Entry point for SFT training."""
 import asyncio
 from dotenv import load_dotenv
@@ -13,7 +17,7 @@ from trainers.sft_trainer import SFTTrainer
 async def main():
     config = SFTConfig()
 
-    training_client = create_training_client(config.model_name, config.lora_rank)
+    training_client = await create_training_client(config.model_name, config.lora_rank)
     tokenizer = training_client.get_tokenizer()
 
     train_dataset = SFTDataset(config.train_data_path, tokenizer, config.max_seq_len)

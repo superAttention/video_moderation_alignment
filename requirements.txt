@@ -1,2 +1,8 @@
 tinker
 python-dotenv
+opencv-python
+Pillow
+datasets
+numpy
+transformers
+torchvision

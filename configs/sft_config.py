@@ -11,6 +11,7 @@ class SFTConfig:
     loss_fn: str = "cross_entropy"
 
     # Data
+    categories: tuple = ("1_Violent_Crimes", "10_Hate", "12_Sexual_Content")
     train_data_path: str = ""
     val_data_path: str = ""
     max_seq_len: int = 512

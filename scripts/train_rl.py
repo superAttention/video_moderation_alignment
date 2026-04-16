@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 """Entry point for RL training (GRPO / PPO)."""
 import asyncio
 from dotenv import load_dotenv
@@ -17,8 +21,8 @@ reward_fns = []  # e.g. [ExactMatchReward(references), LLMJudgeReward(...)]
 async def main():
     config = RLConfig()
 
-    training_client = create_training_client(config.model_name, config.lora_rank)
-    sampling_client = get_sampling_client(training_client)
+    training_client = await create_training_client(config.model_name, config.lora_rank)
+    sampling_client = await get_sampling_client(training_client)
 
     tokenizer = training_client.get_tokenizer()
     prompt_dataset = PromptDataset(config.prompt_data_path, tokenizer, config.max_prompt_len)
