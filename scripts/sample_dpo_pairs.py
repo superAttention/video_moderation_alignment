@@ -12,22 +12,25 @@ Runs AFTER SFT. For each example in data/train.jsonl:
        Level 1 (priority = wrong/N): wrong action  — deterministic ground truth
        Level 2 (priority = 0.5):     wrong category — deterministic ground truth
        Level 3 (priority = 0.2):     all correct, rank rationale by LLM judge
-  4. Examples with highest disagreement (most wrong-action samples) are
-     sorted first in the output — they carry the strongest learning signal.
+  4. Chosen selection: for Level 1/2, pick the BEST-scored correct-action sample
+     (not just the first), so the chosen side is as strong as possible.
+  5. Quality filters:
+       --min_chosen_score: skip pair if best correct response scores below threshold
+       --min_score_margin: skip Level 3 pair if score(chosen)-score(rejected) < margin
 
-Examples where all N samples agree AND the action is correct are still
-included as Level 3 pairs (rationale quality improvement).
+Examples sorted by priority descending in output — highest disagreement first.
 
 Usage:
     python scripts/sample_dpo_pairs.py --sft_checkpoint tinker://uuid/weights/final
 
 Output: data/dpo_pairs.jsonl (sorted by priority descending)
+        data/dpo_pairs_skipped.jsonl (filtered-out examples)
 """
 import json
 import asyncio
 import argparse
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import tinker
 from dotenv import load_dotenv
@@ -71,6 +74,15 @@ async def sample_n(
     ]
 
 
+def score_responses(
+    responses: list[StructuredResponse],
+    evaluator: SchemaEvaluator,
+    example: dict,
+) -> list[float]:
+    """Score a list of parsed responses with the LLM rationale judge."""
+    return [evaluator.rationale_score(r, example) for r in responses]
+
+
 def select_pair(
     samples: list[str],
     gt_action: str,
@@ -79,10 +91,16 @@ def select_pair(
     sft_target: str,
     evaluator: SchemaEvaluator,
     example: dict,
+    min_chosen_score: float,
+    min_score_margin: float,
 ) -> dict | None:
     """
     Select chosen/rejected pair from N samples using the priority hierarchy.
-    Returns None if no meaningful pair can be constructed.
+
+    Level 1/2: chosen = best-scored correct-action sample (not just first).
+    Level 3:   chosen/rejected by rationale score with margin filter.
+
+    Returns None if no pair passes quality filters.
     """
     parsed = [parse_response(s) for s in samples]
 
@@ -91,12 +109,34 @@ def select_pair(
 
     # Level 1: action disagreement — highest signal, fully deterministic
     if incorrect_action:
-        chosen_resp = correct_action[0] if correct_action else parse_response(sft_target)
-        rejected_resp = incorrect_action[0]
+        if not correct_action:
+            # Fall back to SFT target as chosen
+            chosen_resp = parse_response(sft_target)
+        else:
+            # Pick best-scoring correct-action sample as chosen
+            scores = score_responses(correct_action, evaluator, example)
+            chosen_resp = correct_action[max(range(len(scores)), key=lambda i: scores[i])]
+            chosen_score = scores[max(range(len(scores)), key=lambda i: scores[i])]
+            if chosen_score < min_chosen_score:
+                return {"skip_reason": f"chosen_score {chosen_score:.1f} < {min_chosen_score}"}
+
         if chosen_resp is None:
             return None
-        priority = len(incorrect_action) / len(parsed)
+
+        rejected_resp = incorrect_action[0]
+        chosen_score  = evaluator.rationale_score(chosen_resp, example) if not correct_action else chosen_score
+        priority  = len(incorrect_action) / len(parsed)
         pair_type = "action"
+
+        return {
+            "chosen":        to_json_string(chosen_resp),
+            "rejected":      to_json_string(rejected_resp),
+            "priority":      priority,
+            "pair_type":     pair_type,
+            "chosen_score":  chosen_score,
+            "rejected_score": None,   # wrong action — score not meaningful
+            "score_margin":  None,
+        }
 
     # Level 2: category disagreement among correct-action samples
     elif any(
@@ -107,32 +147,58 @@ def select_pair(
         incorrect_cat = [p for p in correct_action if p.risk_category != gt_risk_category]
         if not correct_cat or not incorrect_cat:
             return None
-        chosen_resp  = correct_cat[0]
+
+        # Pick best-scoring correct-category sample as chosen
+        scores = score_responses(correct_cat, evaluator, example)
+        best_idx     = max(range(len(scores)), key=lambda i: scores[i])
+        chosen_resp  = correct_cat[best_idx]
+        chosen_score = scores[best_idx]
+
+        if chosen_score < min_chosen_score:
+            return {"skip_reason": f"chosen_score {chosen_score:.1f} < {min_chosen_score}"}
+
         rejected_resp = incorrect_cat[0]
-        priority = 0.5
-        pair_type = "category"
+        return {
+            "chosen":        to_json_string(chosen_resp),
+            "rejected":      to_json_string(rejected_resp),
+            "priority":      0.5,
+            "pair_type":     "category",
+            "chosen_score":  chosen_score,
+            "rejected_score": None,
+            "score_margin":  None,
+        }
 
     # Level 3: all samples have correct action + category; rank by rationale quality
     else:
         valid = [p for p in parsed if p and p.action == gt_action]
         if len(valid) < 2:
             return None
-        scores = [evaluator.rationale_score(p, example) for p in valid]
+
+        scores    = score_responses(valid, evaluator, example)
         best_idx  = max(range(len(scores)), key=lambda i: scores[i])
         worst_idx = min(range(len(scores)), key=lambda i: scores[i])
-        if best_idx == worst_idx or scores[best_idx] == scores[worst_idx]:
-            return None
-        chosen_resp  = valid[best_idx]
-        rejected_resp = valid[worst_idx]
-        priority = 0.2
-        pair_type = "rationale"
 
-    return {
-        "chosen":   to_json_string(chosen_resp),
-        "rejected": to_json_string(rejected_resp),
-        "priority": priority,
-        "pair_type": pair_type,
-    }
+        if best_idx == worst_idx:
+            return None
+
+        chosen_score   = scores[best_idx]
+        rejected_score = scores[worst_idx]
+        margin         = chosen_score - rejected_score
+
+        if chosen_score < min_chosen_score:
+            return {"skip_reason": f"chosen_score {chosen_score:.1f} < {min_chosen_score}"}
+        if margin < min_score_margin:
+            return {"skip_reason": f"score_margin {margin:.1f} < {min_score_margin}"}
+
+        return {
+            "chosen":        to_json_string(valid[best_idx]),
+            "rejected":      to_json_string(valid[worst_idx]),
+            "priority":      0.2,
+            "pair_type":     "rationale",
+            "chosen_score":  chosen_score,
+            "rejected_score": rejected_score,
+            "score_margin":  margin,
+        }
 
 
 async def main():
@@ -141,7 +207,11 @@ async def main():
                         help="Tinker checkpoint path for SFT model")
     parser.add_argument("--input",  default="data/train.jsonl")
     parser.add_argument("--output", default="data/dpo_pairs.jsonl")
-    parser.add_argument("--n_samples", type=int, default=N_SAMPLES)
+    parser.add_argument("--n_samples",        type=int,   default=N_SAMPLES)
+    parser.add_argument("--min_chosen_score", type=float, default=3.0,
+                        help="Skip pair if best correct response scores below this (1-5)")
+    parser.add_argument("--min_score_margin", type=float, default=1.0,
+                        help="For Level 3 pairs: skip if chosen-rejected score margin < this")
     args = parser.parse_args()
 
     config = SFTConfig()
@@ -164,8 +234,10 @@ async def main():
     ]
     print(f"Loaded {len(examples)} examples from {args.input}")
 
-    pairs = []
-    pair_type_counts: dict[str, int] = defaultdict(int)
+    pairs: list[dict] = []
+    skipped: list[dict] = []
+    pair_type_counts: Counter = Counter()
+    skip_reason_counts: Counter = Counter()
 
     for i, example in enumerate(examples):
         print(f"  [{i+1}/{len(examples)}] {example['question_id']}", flush=True)
@@ -182,21 +254,32 @@ async def main():
             temperature=TEMPERATURE,
         )
 
-        pair = select_pair(
+        result = select_pair(
             samples=raw_samples,
             gt_action=gt_action,
             gt_risk_category=gt_risk_cat,
             gt_sub_category=gt_sub_cat,
             sft_target=example["chosen"],
             evaluator=evaluator,
-            example=example,
+            example={"question": example["question"]},
+            min_chosen_score=args.min_chosen_score,
+            min_score_margin=args.min_score_margin,
         )
 
-        if pair is None:
-            print(f"    → skipped (no meaningful pair)")
+        if result is None:
+            skip_reason_counts["no_valid_pair"] += 1
+            skipped.append({"question_id": example["question_id"], "reason": "no_valid_pair"})
+            print(f"    → skipped (no valid pair)")
             continue
 
-        pair_type_counts[pair["pair_type"]] += 1
+        if "skip_reason" in result:
+            reason = result["skip_reason"]
+            skip_reason_counts[reason.split()[0]] += 1
+            skipped.append({"question_id": example["question_id"], "reason": reason})
+            print(f"    → skipped ({reason})")
+            continue
+
+        pair_type_counts[result["pair_type"]] += 1
         pairs.append({
             "question_id":      example["question_id"],
             "question":         example["question"],
@@ -206,10 +289,13 @@ async def main():
             "gt_action":        gt_action,
             "gt_risk_category": gt_risk_cat,
             "gt_sub_category":  gt_sub_cat,
-            "chosen":           pair["chosen"],
-            "rejected":         pair["rejected"],
-            "priority":         pair["priority"],
-            "pair_type":        pair["pair_type"],
+            "chosen":           result["chosen"],
+            "rejected":         result["rejected"],
+            "priority":         result["priority"],
+            "pair_type":        result["pair_type"],
+            "chosen_score":     result["chosen_score"],
+            "rejected_score":   result["rejected_score"],
+            "score_margin":     result["score_margin"],
         })
 
     # Sort by priority descending — highest disagreement examples first
@@ -218,10 +304,19 @@ async def main():
     out_path = Path(args.output)
     out_path.write_text("\n".join(json.dumps(p) for p in pairs) + "\n")
 
-    print(f"\nGenerated {len(pairs)} DPO pairs → {out_path}")
-    print("Pair type breakdown:")
+    skipped_path = Path(args.output.replace(".jsonl", "_skipped.jsonl"))
+    if skipped:
+        skipped_path.write_text("\n".join(json.dumps(s) for s in skipped) + "\n")
+
+    print(f"\nGenerated {len(pairs)}/{len(examples)} DPO pairs → {out_path}")
+    print(f"Skipped:    {len(skipped)} ({len(examples) - len(pairs) - len(skipped)} no-pair)")
+    print("\nPair type breakdown:")
     for pt, count in sorted(pair_type_counts.items()):
         print(f"  {pt}: {count}")
+    if skip_reason_counts:
+        print("\nSkip reason breakdown:")
+        for reason, count in sorted(skip_reason_counts.items()):
+            print(f"  {reason}: {count}")
 
 
 if __name__ == "__main__":
