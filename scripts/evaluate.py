@@ -84,6 +84,7 @@ async def evaluate_split(
     trace_file,
     skip_rationale: bool,
     no_structured_prompt: bool = False,
+    test_ids: set | None = None,
 ) -> dict:
     """
     Evaluate one split (harmful or benign). Writes a trace line per example.
@@ -95,6 +96,8 @@ async def evaluate_split(
     """
     ds = load_dataset("BAAI/Video-SafetyBench", split=split)
     ds = ds.filter(lambda x: x["category"] in categories)
+    if test_ids is not None:
+        ds = ds.filter(lambda x: x["question_id"] in test_ids)
 
     loop = asyncio.get_event_loop()
     gt_action = ground_truth_action(split)
@@ -220,9 +223,26 @@ async def main():
                         help="Skip LLM rationale judge (faster, no avg_rationale_score)")
     parser.add_argument("--no_structured_prompt", action="store_true",
                         help="Use raw question only — no SYSTEM_PROMPT (for base_freeform run)")
+    parser.add_argument("--test_split", default="data/test.jsonl",
+                        help="Path to held-out test JSONL (default: data/test.jsonl). "
+                             "Pass --test_split '' to evaluate on the full benchmark.")
     args = parser.parse_args()
 
     config = SFTConfig()
+
+    # Load held-out test question IDs to avoid evaluating on training data
+    test_ids = None
+    if args.test_split:
+        test_path = Path(args.test_split)
+        if test_path.exists():
+            test_ids = {
+                json.loads(line)["question_id"]
+                for line in test_path.read_text().splitlines()
+                if line.strip()
+            }
+            print(f"Evaluating on {len(test_ids)} held-out test examples from {test_path}")
+        else:
+            print(f"[warn] {test_path} not found — evaluating on full benchmark")
     sampling_client = await create_eval_sampling_client(
         config.model_name, model_path=args.checkpoint_name
     )
@@ -249,6 +269,7 @@ async def main():
                 evaluator, split, config.categories,
                 trace_file, args.skip_rationale,
                 no_structured_prompt=args.no_structured_prompt,
+                test_ids=test_ids,
             )
             print_split_results(split, results[split])
 
