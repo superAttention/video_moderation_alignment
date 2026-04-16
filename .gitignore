@@ -3,9 +3,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-outputs/
+#outputs/
 ~/logs/
 data/videos/
 data/generated.jsonl
 .DS_Store
 .vscode/
+
