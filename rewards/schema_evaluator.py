@@ -10,6 +10,7 @@ Usage:
     evaluator.action_correct(parsed, "REFUSE")          # True/False
     evaluator.rationale_score(parsed, example)          # float 1-5
 """
+import re
 from openai import OpenAI
 from data.schema import StructuredResponse, parse_response
 
@@ -90,15 +91,15 @@ class SchemaEvaluator:
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user",   "content": prompt},
             ],
-            max_tokens=1,
+            max_tokens=16,
             temperature=0.0,
         )
         raw = result.choices[0].message.content.strip()
-        try:
-            score = float(raw)
-            return max(1.0, min(5.0, score))
-        except ValueError:
-            return 1.0
+        # Extract first digit 1-5 — handles thinking-token prefixes and extra text
+        match = re.search(r'[1-5]', raw)
+        if match:
+            return float(match.group())
+        return 1.0
 
     # ── Composite helpers ─────────────────────────────────────────────────
 

@@ -46,6 +46,7 @@ from data.schema import (
     parse_response,
     to_json_string,
     ground_truth_action,
+    decode_model_output,
 )
 from rewards.schema_evaluator import SchemaEvaluator
 
@@ -69,7 +70,7 @@ async def sample_n(
         sampling_params=tinker.types.SamplingParams(max_tokens=256, temperature=temperature),
     )
     return [
-        tokenizer.decode(seq.tokens, skip_special_tokens=True)
+        decode_model_output(tokenizer, seq.tokens)
         for seq in result.sequences
     ]
 

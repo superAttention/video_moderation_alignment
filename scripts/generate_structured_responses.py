@@ -5,18 +5,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 """
 Generate structured JSON training data from Video-SafetyBench.
 
-Replaces generate_responses.py for the schema-output pipeline.
-
 For each (video, question) pair across both harmful and benign splits:
-  - action, risk_category, sub_category: determined from benchmark metadata (no LLM needed)
-  - short_rationale: Best-of-K selection — sample K candidates, score with LLM judge,
-                     keep the highest-scoring one above --min_score threshold
+  - action, risk_category, sub_category: deterministic from benchmark metadata
+  - short_rationale: Best-of-K selection — sample K candidates from the base model
+                     conditioned on the correct action, score all K with the LLM
+                     judge concurrently, keep the highest-scoring one
+
+Examples where best candidate scores below --min_score are skipped.
 
 Run before training:
     python scripts/generate_structured_responses.py
 
 Output: data/generated_structured.jsonl
-        data/generated_structured_skipped.jsonl  (examples below min_score)
+        data/generated_structured_skipped.jsonl
 """
 import json
 import asyncio
@@ -43,8 +44,10 @@ from data.schema import (
     path_to_subcategory,
     to_json_string,
     make_question_with_prompt,
+    decode_model_output,
 )
 from rewards.schema_evaluator import SchemaEvaluator
+
 
 
 async def generate_best_rationale(
@@ -56,13 +59,11 @@ async def generate_best_rationale(
     action: str,
     n_samples: int,
     question: str,
+    loop: asyncio.AbstractEventLoop,
 ) -> tuple[str, float]:
     """
     Sample n_samples rationale candidates and return (best_rationale, best_score).
-
-    The base model is told the correct action and asked to describe the visual
-    content that justifies it — not to make a decision itself.
-    Candidates are scored by SchemaEvaluator.rationale_score (1-5).
+    The K judge calls are made concurrently via run_in_executor.
     """
     prompt = RATIONALE_GENERATION_PROMPT.format(
         category=risk_category,
@@ -79,19 +80,23 @@ async def generate_best_rationale(
         sampling_params=tinker.types.SamplingParams(max_tokens=128, temperature=0.7),
     )
     candidates = [
-        tokenizer.decode(seq.tokens, skip_special_tokens=True).strip()
+        decode_model_output(tokenizer, seq.tokens)
         for seq in result.sequences
     ]
 
-    scores = []
-    for rationale in candidates:
+    # Score all K candidates concurrently (each is a blocking HTTP call)
+    def score_one(rationale: str) -> float:
         tmp = StructuredResponse(
             action=action,
             risk_category=risk_category,
             sub_category=sub_category,
             short_rationale=rationale,
         )
-        scores.append(evaluator.rationale_score(tmp, {"question": question}))
+        return evaluator.rationale_score(tmp, {"question": question})
+
+    scores = await asyncio.gather(*[
+        loop.run_in_executor(None, score_one, c) for c in candidates
+    ])
 
     best_idx = max(range(len(scores)), key=lambda i: scores[i])
     return candidates[best_idx], scores[best_idx]
@@ -102,8 +107,7 @@ async def main():
     parser.add_argument("--n_rationale_samples", type=int, default=5,
                         help="Number of rationale candidates per example (Best-of-K)")
     parser.add_argument("--min_score", type=float, default=3.0,
-                        help="Minimum judge score (1-5) to include an example. "
-                             "Examples below threshold go to _skipped.jsonl.")
+                        help="Min judge score (1-5) to include an example")
     args = parser.parse_args()
 
     config = SFTConfig()
@@ -122,10 +126,10 @@ async def main():
     out_path.parent.mkdir(exist_ok=True)
 
     score_counts: Counter = Counter()
-    n_total = 0
-    n_skipped = 0
+    n_total = n_skipped = 0
     score_sum = 0.0
     skipped_examples = []
+    loop = asyncio.get_event_loop()
 
     with out_path.open("w") as f:
         for split in ["harmful", "benign"]:
@@ -137,7 +141,6 @@ async def main():
                 n_total += 1
                 print(f"[{split}] {i+1}/{total} — {example['question_id']}", flush=True)
 
-                # Ground truth fields — deterministic, no LLM needed
                 action   = ground_truth_action(split)
                 risk_cat = category_to_risk(example["category"])
                 sub_cat  = path_to_subcategory(example["video_path"])
@@ -151,6 +154,7 @@ async def main():
                     action=action,
                     n_samples=args.n_rationale_samples,
                     question=question,
+                    loop=loop,
                 )
 
                 score_counts[int(score)] += 1
@@ -170,24 +174,18 @@ async def main():
                 score_sum += score
 
                 chosen_resp = StructuredResponse(
-                    action=action,
-                    risk_category=risk_cat,
-                    sub_category=sub_cat,
-                    short_rationale=rationale,
+                    action=action, risk_category=risk_cat,
+                    sub_category=sub_cat, short_rationale=rationale,
                 )
-
                 wrong_action = "ESCALATE_WITH_ANALYSIS" if action == "REFUSE" else "REFUSE"
                 rejected_resp = StructuredResponse(
-                    action=wrong_action,
-                    risk_category=risk_cat,
-                    sub_category=sub_cat,
+                    action=wrong_action, risk_category=risk_cat, sub_category=sub_cat,
                     short_rationale=(
                         "This content may warrant human review rather than outright refusal."
                         if wrong_action == "ESCALATE_WITH_ANALYSIS"
                         else "This content appears harmful and should be refused."
                     ),
                 )
-
                 chosen_str   = to_json_string(chosen_resp)
                 rejected_str = to_json_string(rejected_resp)
 
@@ -207,7 +205,6 @@ async def main():
                 }) + "\n")
                 f.flush()
 
-    # Write skipped examples for inspection
     if skipped_examples:
         skipped_path.write_text(
             "\n".join(json.dumps(e) for e in skipped_examples) + "\n"
@@ -215,13 +212,12 @@ async def main():
 
     n_kept = n_total - n_skipped
     avg_score = score_sum / n_kept if n_kept > 0 else 0.0
-
     print(f"\nGenerated {n_kept}/{n_total} examples  "
-          f"({n_skipped} skipped, avg best score: {avg_score:.2f})")
+          f"({n_skipped} skipped, avg score: {avg_score:.2f})")
     print("Score distribution: " +
           "  ".join(f"{k}={v}" for k, v in sorted(score_counts.items())))
     if skipped_examples:
-        print(f"Skipped examples → {skipped_path}")
+        print(f"Skipped → {skipped_path}")
     print(f"\nOutput → {out_path}")
     print("Run scripts/split_data.py next.")
 

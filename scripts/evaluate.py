@@ -57,6 +57,7 @@ from data.schema import (
     category_to_risk,
     path_to_subcategory,
     make_question_with_prompt,
+    decode_model_output,
 )
 from rewards.schema_evaluator import SchemaEvaluator
 
@@ -73,7 +74,7 @@ async def generate_response(
         num_samples=1,
         sampling_params=tinker.types.SamplingParams(max_tokens=256, temperature=0.0),
     )
-    return tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True)
+    return decode_model_output(tokenizer, result.sequences[0].tokens)
 
 
 async def evaluate_split(
