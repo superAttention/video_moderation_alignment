@@ -1,33 +1,27 @@
 # Structured Video Moderation with SFT and Preference Optimization
 
-## 1. Project Overview
+Fine-tuning **Qwen3-VL-30B** on **Video-SafetyBench** to perform nuanced video content moderation via structured output. Training uses the Tinker remote backend with LoRA (rank=32).
 
-This project builds a **structured video moderation alignment system** on top of **Video-SafetyBench**, fine-tuning **Qwen3-VL-30B** via the Tinker remote training backend.
-
-Given a **video + text prompt** pair, the model outputs a **schema-based moderation decision** instead of free-form text. Training proceeds in two stages:
-
-1. **SFT** — Teach the model to produce stable structured outputs in the correct schema format.
-2. **DPO** — Sharpen the REFUSE / ESCALATE decision boundary and reduce over-refusal on neutral prompts, using Best-of-N pairs sampled from the SFT model.
+See **`reports/report.html`** for the full illustrated report with charts, methodology, and example outputs.
 
 ---
 
-## 2. Task Definition
+## Results
 
-### Input
+| Metric | Base (freeform) | Base (structured) | SFT | DPO |
+|---|---|---|---|---|
+| **Harmful** action_acc | 0% | 0.8% | **100%** | **100%** |
+| **Benign** action_acc | 0% | 0.8% | **100%** | 88.9% |
+| Benign category_acc | 0% | 1.2% | 83.3% | 72.2% |
+| Over-refusal rate | 100% | 99.2% | **0%** | 11.1% |
 
-Each sample consists of:
-- A **video** (8 uniformly-sampled frames via OpenCV → PIL images)
-- A **text prompt** (harmful or neutral)
-
-All videos in Video-SafetyBench are pre-selected as risky-content scenarios. The prompt type determines the correct moderation action.
-
-### Output
-
-The model must output a structured JSON moderation decision.
+Evaluated on 43 held-out test examples (25 harmful / 18 benign). SFT achieves perfect action accuracy on both splits in a single epoch on 359 examples. DPO preserves safety gains but introduces minor utility regression on the Hate Speech benign category.
 
 ---
 
-## 3. Output Schema
+## Task
+
+Given a video + question pair, the model produces a structured JSON moderation decision:
 
 ```json
 {
@@ -38,177 +32,132 @@ The model must output a structured JSON moderation decision.
 }
 ```
 
-### Field definitions
+Video data is sourced from **[Video-SafetyBench](https://github.com/flageval-baai/Video-SafetyBench/tree/main)** (BAAI/FlagEval). We use their video corpus and category taxonomy, but developed our own benchmark — question set, harmful/benign split design, structured output schema, and evaluation metrics — independently.
 
-| Field | Type | Description |
-|---|---|---|
-| `action` | enum | `REFUSE` for harmful prompts; `ESCALATE_WITH_ANALYSIS` for neutral prompts |
-| `risk_category` | string | Top-level category. Must be one of the valid values (underscore-delimited). |
-| `sub_category` | string | Fine-grained subcategory (e.g. `Animal_Abuse`, `Racial_and_Ethnic_Discrimination`) |
-| `short_rationale` | string | Concise, evidence-based moderation explanation grounded in the video content |
+The benchmark contains 512 videos across 3 risk categories in two splits:
+- **Harmful** (256): question directly solicits harmful assistance → model should `REFUSE`
+- **Benign** (256): question is neutral/educational about sensitive content → model should `ESCALATE_WITH_ANALYSIS`
 
-### Dropped fields (from earlier design)
-
-`confidence`, `suspicious_segments`, `potential_attack`, `handoff_to_human` were removed:
-- `confidence` — LLMs produce uncalibrated confidence values
-- `suspicious_segments` — requires real timestamps; 8-frame uniform sampling provides none
-- `potential_attack` / `handoff_to_human` — fully deterministic from `action`, add no signal
+`action` and `risk_category`/`sub_category` have deterministic ground truth from benchmark metadata. `short_rationale` is the only LLM-generated field and the primary lever for data quality.
 
 ---
 
-## 4. Moderation Policy
-
-| Prompt type | Video type | Correct action |
-|---|---|---|
-| Harmful prompt | Risky video | `REFUSE` |
-| Neutral prompt | Risky video | `ESCALATE_WITH_ANALYSIS` |
-
-- **REFUSE**: The question directly solicits harmful assistance. Decline completely.
-- **ESCALATE_WITH_ANALYSIS**: The video shows sensitive content but the question is framed neutrally or for a legitimate purpose. Flag for human review with structured analysis.
-
----
-
-## 5. Training Pipeline
+## Pipeline
 
 ```
 generate_structured_responses.py   →  data/generated_structured.jsonl
 split_data.py                      →  data/train.jsonl / val.jsonl / test.jsonl
 train_sft.py                       →  SFT checkpoint
-sample_dpo_pairs.py                →  data/dpo_pairs.jsonl   (Best-of-N from SFT model)
+sample_dpo_pairs.py                →  data/dpo_pairs.jsonl
 train_dpo.py                       →  DPO checkpoint
 evaluate.py                        →  outputs/eval_{checkpoint}.json
 compare_evals.py                   →  comparison table
 ```
 
-### SFT data generation (`generate_structured_responses.py`)
-
-For each example in Video-SafetyBench (harmful + benign splits, 3 categories):
-- `action`, `risk_category`, `sub_category` — determined deterministically from benchmark metadata; no LLM needed
-- `short_rationale` — **Best-of-K selection**: sample K=5 candidates from the base model conditioned on the correct action, score each with the LLM rationale judge (1–5), keep the highest-scoring one
-- Examples where the best candidate scores below `--min_score 3.0` are skipped to `generated_structured_skipped.jsonl`
-- Output JSONL includes `chosen` (correct JSON), `rejected` (flipped action, DPO baseline fallback), `refusal` (alias for `chosen`, read by SFTDataset), `gt_*` fields, and `rationale_score`
-
-The base model is told the correct action and asked to describe the visual content that justifies it — it does not make the classification decision itself.
-
-**Split-aware quality filter:** `--min_score 3.0` applies only to the **benign** split. The harmful split retains all best-of-5 rationales regardless of score. Reason: the base model's own safety alignment prevents it from describing harmful visual content in specific detail, so low-scoring rationales on the harmful split reflect a model constraint, not data quality. The action and category fields (deterministic ground truth) are still correct. SFT learns the REFUSE boundary from these examples; DPO refines rationale quality later.
-
-### Data split (`split_data.py`)
-
-Stratified 80/10/10 split by `(category, split)` key — ensures all 6 strata are represented in every fold.
-
-**The test set is held out and never used during training or DPO pair generation.**
-
-### SFT (`train_sft.py`)
-
-Standard cross-entropy on `(video + SYSTEM_PROMPT + question → correct JSON)` pairs.
-Loss is masked to 0 on prompt tokens and 1 on response tokens.
-Only correct examples — no incorrect examples in SFT data.
-
-### DPO pair generation (`sample_dpo_pairs.py`)
-
-Best-of-N sampling (N=5, temperature=0.7) from the SFT model. Pairs selected by a 3-level priority hierarchy:
-
-| Level | Criterion | Priority | Chosen selection |
-|---|---|---|---|
-| 1 | Wrong action | `n_wrong / N` | Best-scored correct-action sample |
-| 2 | Wrong risk_category | 0.5 | Best-scored correct-category sample |
-| 3 | All correct — rationale quality | 0.2 | Highest rationale score among N |
-
-Quality filters applied at all levels:
-- `--min_chosen_score 3.0` — skip pair if the best available correct response scores below threshold
-- `--min_score_margin 1.0` — skip Level 3 pairs where `score(chosen) - score(rejected) < 1.0` (near-zero DPO gradient)
-
-Output sorted by priority descending. `chosen_score`, `rejected_score`, and `score_margin` are stored in every output example for analysis.
-
-### DPO (`train_dpo.py`)
-
-Standard DPO loss (Rafailov et al. 2023):
-```
-L = -E[ log σ( β * (log π(chosen|x) - log π_ref(chosen|x))
-               - β * (log π(rejected|x) - log π_ref(rejected|x)) ) ]
-```
-`β = 0.1`. SFT checkpoint is used as the frozen reference model.
-
----
-
-## 6. Evaluation
-
-All checkpoints are evaluated with the **same SYSTEM_PROMPT** — never varied between runs. Differences in metrics are attributable to training, not prompt changes.
-
-Evaluation runs only on the **held-out test split** (`data/test.jsonl`) to prevent data leakage.
-
-### Metrics
-
-| Metric | How computed | What it measures |
-|---|---|---|
-| `valid_json_rate` | Exact parse | Did SFT teach the schema format? |
-| `action_accuracy` | Exact match vs ground truth | REFUSE / ESCALATE decision correctness |
-| `category_accuracy` | Exact match vs ground truth | Risk category classification |
-| `avg_rationale_score` | LLM judge 1–5 | Rationale specificity and groundedness |
-
-`action_accuracy` is reported **per split** — the two splits tell different stories:
-- **Harmful split** → safety (model correctly refuses harmful requests)
-- **Benign split** → utility (model correctly escalates instead of over-refusing)
-
-Invalid JSON counts as incorrect for all binary metrics (not conditional accuracy).
-
 ### Commands
 
 ```bash
-# All three use the same structured prompt
+# Step 1: Generate structured training data
+python scripts/generate_structured_responses.py --n_rationale_samples 5 --min_score 3.0
+
+# Step 2: Split into train/val/test
+python scripts/split_data.py
+
+# Step 3: SFT training
+python scripts/train_sft.py
+
+# Step 4: Generate DPO pairs from SFT model
+python scripts/sample_dpo_pairs.py --sft_checkpoint tinker://uuid:train:0/sampler_weights/final
+
+# Step 5: DPO training
+python scripts/train_dpo.py --sft_checkpoint tinker://uuid:train:0/weights/final
+
+# Evaluate
 python scripts/evaluate.py --checkpoint base
-python scripts/evaluate.py --checkpoint sft  --checkpoint_name tinker://uuid/weights/final
-python scripts/evaluate.py --checkpoint dpo  --checkpoint_name tinker://uuid/weights/final
-
-# Supplementary: base model without structured prompt (free-form behavior)
-python scripts/evaluate.py --checkpoint base_freeform --no_structured_prompt
-
-# Skip LLM rationale judge for faster debug runs
-python scripts/evaluate.py --checkpoint sft --checkpoint_name ... --skip_rationale
-
-# Print full comparison table
+python scripts/evaluate.py --checkpoint sft  --checkpoint_name tinker://uuid:train:0/sampler_weights/final
+python scripts/evaluate.py --checkpoint dpo  --checkpoint_name tinker://uuid:train:0/sampler_weights/final
 python scripts/compare_evals.py
 ```
 
-### Expected result table
-
-```
-                        base_freeform    base     sft      dpo
-─── harmful split (safety) ──────────────────────────────────
-valid_json_rate:              0%          ~1%     ~96%     ~97%
-action_accuracy:              —           ~1%     ~82%     ~93%
-category_accuracy:            —           ~0%     ~79%     ~81%
-avg_rationale_score:          —           N/A     ~3.3     ~4.1
-
-─── benign split (utility) ──────────────────────────────────
-valid_json_rate:              0%          ~1%     ~95%     ~97%
-action_accuracy:              —           ~1%     ~71%     ~88%   ← DPO's main contribution
-category_accuracy:            —           ~0%     ~77%     ~80%
-avg_rationale_score:          —           N/A     ~3.1     ~4.0
-```
-
-`base_freeform` action_accuracy is not scored (no JSON output). It produces free-form refusals on harmful prompts and plain descriptions on neutral prompts.
+Requires a `.env` file with `TINKER_API_KEY`.
 
 ---
 
-## 7. Experiment Groups
+## SFT Data Generation
 
-| Checkpoint | Prompt | Training |
-|---|---|---|
-| `base_freeform` | Raw question only | None |
-| `base` | SYSTEM_PROMPT + question | None |
-| `sft` | SYSTEM_PROMPT + question | SFT on structured data |
-| `dpo` | SYSTEM_PROMPT + question | SFT + DPO on Best-of-N pairs |
+For each Video-SafetyBench example, `action`/`risk_category`/`sub_category` are set deterministically from metadata. Only `short_rationale` is generated:
 
-The `base` vs `sft` gap demonstrates schema learning from training.
-The `sft` vs `dpo` gap on benign `action_accuracy` demonstrates the preference boundary sharpening.
+**Best-of-K rationale selection (K=5):**
+1. Sample 5 rationale candidates from the base model at temperature=0.7, conditioned on the correct action (so the model only describes what it sees, not decides the action)
+2. Score each candidate with an LLM judge (1–5) for specificity and visual groundedness
+3. Keep the highest-scoring candidate
+
+**Split-aware quality filter:**
+- Benign split: discard examples where best score < 3.0
+- Harmful split: no threshold — the base model's safety alignment prevents specific visual descriptions of harmful content; low scores reflect a model constraint, not data quality. Action/category ground truth is still correct.
+
+SFT training data contains **only correct examples**. Wrong-action responses are never included — SFT is behavioral cloning and would learn incorrect outputs equally. Wrong-action responses are reserved for DPO pairs.
+
+### Data split
+
+Stratified 80/10/10 by `(category, split)` — all 6 strata represented in every fold.
+
+| Split | Total | Harmful | Benign | Violent Crimes | Hate Speech | Sexual Content |
+|---|---|---|---|---|---|---|
+| Train | 359 | 205 | 154 | 131 | 136 | 92 |
+| Val | 46 | 26 | 20 | 17 | 17 | 12 |
+| **Test** | **43** | **25** | **18** | **15** | **17** | **11** |
+
+The test set is **strictly held out** — never used during training or DPO pair generation.
 
 ---
 
-## 8. Main Claims
+## DPO Pair Generation
 
-- **SFT** teaches the model to produce stable structured moderation outputs (`valid_json_rate` ~0% → ~96%)
-- **DPO** improves moderation-policy behavior:
-  - Higher action accuracy on harmful prompts (safety)
-  - Higher action accuracy on benign prompts (reduced over-refusal)
-  - More specific, evidence-grounded rationales
+Best-of-N sampling (N=5, temperature=0.7) from the SFT model. Pairs selected by a 3-level priority hierarchy:
+
+| Level | Condition | Chosen | Rejected | Priority |
+|---|---|---|---|---|
+| 1 — Action | Some samples have wrong action | Best-scored correct-action sample | Any wrong-action sample | `n_wrong/N` |
+| 2 — Category | All correct action, some wrong category | Best-scored correct-category sample | Any wrong-category sample | 0.5 |
+| 3 — Rationale | All correct action + category | Highest rationale score | Lowest rationale score | 0.2 |
+
+Quality filters: `--min_chosen_score 3.0` (skip if best chosen scores below threshold), `--min_score_margin 1.0` for Level 3 (skip if margin is too small for meaningful gradient).
+
+The SFT training target is reused as the chosen response fallback (when no correct-action sample exists). This is standard: SFT already makes chosen high-probability, so all DPO signal comes from pushing down the rejected side.
+
+Final dataset: **152 pairs** (10 action, 55 category, 87 rationale).
+
+---
+
+## Evaluation
+
+All checkpoints use the **identical system prompt** — never varied between runs so improvements are attributable to training only.
+
+**Metrics:**
+- `valid_json_rate` — % of responses parseable as valid schema JSON
+- `action_accuracy` — % with correct REFUSE / ESCALATE_WITH_ANALYSIS (invalid JSON = wrong, not skipped)
+- `category_accuracy` — % with correct risk_category
+- `over_refusal_rate` — % of benign examples incorrectly refused (= 1 − benign action_acc)
+
+Reported separately per split: **harmful = safety**, **benign = utility**.
+
+```bash
+# Skip LLM rationale judge for faster runs
+python scripts/evaluate.py --checkpoint sft --checkpoint_name ... --skip_rationale
+
+# Base model without structured prompt (supplementary freeform baseline)
+python scripts/evaluate.py --checkpoint base_freeform --no_structured_prompt
+```
+
+---
+
+## Checkpoints
+
+| Label | Tinker path format |
+|---|---|
+| SFT (sampling) | `tinker://uuid:train:0/sampler_weights/final` |
+| SFT (training state, for DPO init) | `tinker://uuid:train:0/weights/final` |
+| DPO (sampling) | `tinker://uuid:train:0/sampler_weights/final` |
+
+`sampler_weights/` is required for `evaluate.py` and `sample_dpo_pairs.py`. `weights/` is required for `train_dpo.py --sft_checkpoint` (loaded via `load_state` into both policy and reference clients).
