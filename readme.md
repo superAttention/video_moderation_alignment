@@ -2,7 +2,7 @@
 
 Fine-tuning **Qwen3-VL-30B** on **Video-SafetyBench** to perform nuanced video content moderation via structured output. Training uses the Tinker remote backend with LoRA (rank=32).
 
-See **`reports/report.html`** for the full illustrated report with charts, methodology, and example outputs.
+See [this](https://superattention.github.io/video_moderation_alignment/reports/report.html) for the full illustrated report with charts, methodology, and example outputs.
 
 ---
 
