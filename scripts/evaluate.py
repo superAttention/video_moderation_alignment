@@ -5,27 +5,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 """
 Evaluate a model checkpoint on Video-SafetyBench.
 
-Run at three points for comparison:
-    python scripts/evaluate.py --checkpoint base   # before any training
-    python scripts/evaluate.py --checkpoint sft    # after SFT
-    python scripts/evaluate.py --checkpoint dpo    # after DPO
+All three checkpoints use the SAME structured prompt — never vary the prompt
+between runs, or improvements cannot be attributed to training.
 
-Metrics per split, per category:
-  Legacy (backward-compatible with baseline):
-    - refusal_rate:    % of responses classified as refusals by RJScore
-    - attack_success:  % of responses that comply (1 - refusal_rate)
+Usage:
+    python scripts/evaluate.py --checkpoint base
+    python scripts/evaluate.py --checkpoint sft  --checkpoint_name tinker://uuid/weights/final
+    python scripts/evaluate.py --checkpoint dpo  --checkpoint_name tinker://uuid/weights/final
 
-  Structured output (base model outputs free-form, so these are 0 for base):
-    - valid_json_rate:      % of responses that parse as valid JSON schema
-    - action_accuracy:      % with correct REFUSE/ESCALATE_WITH_ANALYSIS
-    - category_accuracy:    % with correct risk_category
-    - subcategory_accuracy: % with correct sub_category
-    - over_refusal_rate:    % of BENIGN examples that were incorrectly REFUSED
-    - avg_rationale_score:  mean LLM-judge score (1-5) for short_rationale
+    # Skip the LLM rationale judge for faster runs (e.g. debugging):
+    python scripts/evaluate.py --checkpoint sft --checkpoint_name ... --skip_rationale
+
+Metrics (per split: harmful / benign):
+    valid_json_rate      — % of responses that parse as valid schema JSON
+    action_accuracy      — % with correct REFUSE / ESCALATE_WITH_ANALYSIS
+                           (invalid JSON counts as wrong)
+    category_accuracy    — % with correct risk_category (invalid JSON = wrong)
+    avg_rationale_score  — mean LLM-judge score 1-5 for short_rationale quality
+                           (only for valid JSON; skipped if --skip_rationale)
+
+The harmful/benign split tells the core story:
+    harmful action_accuracy  → safety  (model correctly refuses harmful requests)
+    benign  action_accuracy  → utility (model correctly escalates, doesn't over-refuse)
 
 Outputs:
-    outputs/eval_{checkpoint}.jsonl   — one line per example (response + all scores)
-    outputs/eval_{checkpoint}.json    — aggregated metrics
+    outputs/eval_{checkpoint}.jsonl  — one line per example
+    outputs/eval_{checkpoint}.json   — aggregated metrics
+
+Run compare_evals.py after all three checkpoints to print the full table.
 """
 import os
 import json
@@ -33,13 +40,14 @@ import asyncio
 import argparse
 from pathlib import Path
 from collections import defaultdict
+
+import tinker
 from dotenv import load_dotenv
 from datasets import load_dataset
-import tinker
+from openai import OpenAI
 
 load_dotenv()
 
-from openai import OpenAI
 from client import create_eval_sampling_client, load_processor
 from configs.sft_config import SFTConfig
 from data.video_utils import resolve_path, extract_frames
@@ -50,12 +58,12 @@ from data.schema import (
     path_to_subcategory,
     make_question_with_prompt,
 )
-from rewards.rjscore import RJScoreEvaluator, THRESHOLD
 from rewards.schema_evaluator import SchemaEvaluator
 
 
-async def generate_response(sampling_client, processor, tokenizer, question: str, video_path: str) -> str:
-    """Run inference on one (question, video) pair. Returns decoded response string."""
+async def generate_response(
+    sampling_client, processor, tokenizer, question: str, video_path: str
+) -> str:
     frames = extract_frames(video_path)
     inputs = processor(text=question, images=frames, return_tensors="pt")
     token_ids = inputs["input_ids"][0].tolist()
@@ -70,199 +78,149 @@ async def generate_response(sampling_client, processor, tokenizer, question: str
 
 async def evaluate_split(
     sampling_client, processor, tokenizer,
-    rj_evaluator: RJScoreEvaluator,
-    schema_evaluator: SchemaEvaluator,
+    evaluator: SchemaEvaluator,
     split: str,
     categories: tuple,
     trace_file,
-    use_structured_prompt: bool,
+    skip_rationale: bool,
+    no_structured_prompt: bool = False,
 ) -> dict:
     """
-    Run inference on every example in the split (filtered to categories).
-    Computes both legacy RJScore metrics and structured output metrics.
-    Writes one JSON line per example to trace_file as it goes.
+    Evaluate one split (harmful or benign). Writes a trace line per example.
+
+    Returns aggregated metrics dict with keys:
+        overall: {valid_json_rate, action_accuracy, category_accuracy,
+                  avg_rationale_score, n}
+        by_category: {category: same shape}
     """
     ds = load_dataset("BAAI/Video-SafetyBench", split=split)
     ds = ds.filter(lambda x: x["category"] in categories)
 
     loop = asyncio.get_event_loop()
+    gt_action = ground_truth_action(split)
 
     # Per-category accumulators
-    per_cat_refused:             dict[str, list[bool]]  = defaultdict(list)
-    per_cat_valid_json:          dict[str, list[bool]]  = defaultdict(list)
-    per_cat_action_correct:      dict[str, list[bool]]  = defaultdict(list)
-    per_cat_category_correct:    dict[str, list[bool]]  = defaultdict(list)
-    per_cat_subcategory_correct: dict[str, list[bool]]  = defaultdict(list)
-    per_cat_rationale_scores:    dict[str, list[float]] = defaultdict(list)
-
-    gt_action      = ground_truth_action(split)
-    is_benign      = split == "benign"
+    acc: dict[str, dict[str, list]] = defaultdict(lambda: {
+        "valid_json":       [],
+        "action_correct":   [],
+        "category_correct": [],
+        "rationale_scores": [],
+    })
 
     for i, example in enumerate(ds):
         print(f"  [{split}] {i+1}/{len(ds)} — {example['question_id']}", flush=True)
 
         question = (
             make_question_with_prompt(example["question"])
-            if use_structured_prompt
+            if not no_structured_prompt
             else example["question"]
         )
-
         response = await generate_response(
             sampling_client, processor, tokenizer,
             question=question,
             video_path=resolve_path(example["video_path"]),
         )
 
-        cat  = example["category"]
+        cat         = example["category"]
         gt_risk_cat = category_to_risk(cat)
         gt_sub_cat  = path_to_subcategory(example["video_path"])
 
-        # ── Legacy RJScore ────────────────────────────────────────────────
-        risk_score = await loop.run_in_executor(
-            None, rj_evaluator.score,
-            example["harmful_intention"], response, cat,
-        )
-        refused = risk_score <= THRESHOLD
-        per_cat_refused[cat].append(refused)
+        parsed         = parse_response(response)
+        valid          = parsed is not None
+        action_correct = valid and evaluator.action_correct(parsed, gt_action)
+        cat_correct    = valid and evaluator.category_correct(parsed, gt_risk_cat)
 
-        # ── Structured metrics ────────────────────────────────────────────
-        parsed = parse_response(response)
-        valid  = parsed is not None
-
-        per_cat_valid_json[cat].append(valid)
-        per_cat_action_correct[cat].append(
-            valid and schema_evaluator.action_correct(parsed, gt_action)
-        )
-        per_cat_category_correct[cat].append(
-            valid and schema_evaluator.category_correct(parsed, gt_risk_cat)
-        )
-        per_cat_subcategory_correct[cat].append(
-            valid and schema_evaluator.subcategory_correct(parsed, gt_sub_cat)
-        )
-
-        rat_score = 0.0
-        if valid:
+        rat_score = None
+        if valid and not skip_rationale:
             rat_score = await loop.run_in_executor(
-                None, schema_evaluator.rationale_score,
-                parsed, {"question": question},
+                None, evaluator.rationale_score, parsed, {"question": question},
             )
-        per_cat_rationale_scores[cat].append(rat_score)
+
+        acc[cat]["valid_json"].append(valid)
+        acc[cat]["action_correct"].append(action_correct)
+        acc[cat]["category_correct"].append(cat_correct)
+        if rat_score is not None:
+            acc[cat]["rationale_scores"].append(rat_score)
 
         trace_file.write(json.dumps({
-            "split":               split,
-            "question_id":         example["question_id"],
-            "category":            cat,
-            "question":            example["question"],
-            "harmful_intention":   example["harmful_intention"],
-            "response":            response,
-            # Legacy
-            "risk_score":          risk_score,
-            "refused":             refused,
-            # Structured
-            "valid_json":          valid,
-            "action_correct":      bool(valid and schema_evaluator.action_correct(parsed, gt_action)),
-            "category_correct":    bool(valid and schema_evaluator.category_correct(parsed, gt_risk_cat)),
-            "subcategory_correct": bool(valid and schema_evaluator.subcategory_correct(parsed, gt_sub_cat)),
-            "rationale_score":     rat_score,
-            "gt_action":           gt_action,
-            "gt_risk_category":    gt_risk_cat,
-            "gt_sub_category":     gt_sub_cat,
+            "split":            split,
+            "question_id":      example["question_id"],
+            "category":         cat,
+            "question":         example["question"],
+            "response":         response,
+            "gt_action":        gt_action,
+            "gt_risk_category": gt_risk_cat,
+            "gt_sub_category":  gt_sub_cat,
+            "valid_json":       valid,
+            "action_correct":   action_correct,
+            "category_correct": cat_correct,
+            "rationale_score":  rat_score,
         }) + "\n")
         trace_file.flush()
 
-    # ── Aggregate metrics ─────────────────────────────────────────────────
-    def agg(results: list, scores: list[float] | None = None) -> dict:
-        n = len(results)
-        rate = sum(results) / n if n else 0.0
-        d = {"rate": rate, "n": n}
-        if scores is not None:
-            d["avg_score"] = sum(scores) / n if n else 0.0
-        return d
-
-    all_cats = list(per_cat_refused.keys())
-
-    def overall(per_cat: dict) -> list:
-        return [v for vals in per_cat.values() for v in vals]
-
-    def overall_scores(per_cat: dict) -> list:
-        return [v for vals in per_cat.values() for v in vals]
-
-    all_refused       = overall(per_cat_refused)
-    all_valid         = overall(per_cat_valid_json)
-    all_action        = overall(per_cat_action_correct)
-    all_category      = overall(per_cat_category_correct)
-    all_subcategory   = overall(per_cat_subcategory_correct)
-    all_rat_scores    = overall_scores(per_cat_rationale_scores)
-    n_total           = len(all_refused)
-
-    over_refusal = None
-    if is_benign and n_total > 0:
-        # Over-refusal: benign examples incorrectly refused
-        # Using action_correct as proxy: action_correct=False on benign means model said REFUSE
-        over_refusal = sum(not v for v in all_action) / n_total
-
-    def build_overall() -> dict:
-        d = {
-            "refusal_rate":         sum(all_refused)     / n_total,
-            "attack_success":       1 - sum(all_refused) / n_total,
-            "valid_json_rate":      sum(all_valid)        / n_total,
-            "action_accuracy":      sum(all_action)       / n_total,
-            "category_accuracy":    sum(all_category)     / n_total,
-            "subcategory_accuracy": sum(all_subcategory)  / n_total,
-            "avg_rationale_score":  sum(all_rat_scores)   / n_total,
-            "n":                    n_total,
+    def agg(cat_data: dict) -> dict:
+        vj  = cat_data["valid_json"]
+        ac  = cat_data["action_correct"]
+        cc  = cat_data["category_correct"]
+        rs  = cat_data["rationale_scores"]
+        n   = len(vj)
+        return {
+            "valid_json_rate":     sum(vj) / n,
+            "action_accuracy":     sum(ac) / n,
+            "category_accuracy":   sum(cc) / n,
+            "avg_rationale_score": sum(rs) / len(rs) if rs else None,
+            "n": n,
         }
-        if over_refusal is not None:
-            d["over_refusal_rate"] = over_refusal
-        return d
 
-    def build_by_category() -> dict:
-        result = {}
-        for c in all_cats:
-            n = len(per_cat_refused[c])
-            ref_rate = sum(per_cat_refused[c]) / n
-            result[c] = {
-                "refusal_rate":         ref_rate,
-                "attack_success":       1 - ref_rate,
-                "valid_json_rate":      sum(per_cat_valid_json[c])          / n,
-                "action_accuracy":      sum(per_cat_action_correct[c])      / n,
-                "category_accuracy":    sum(per_cat_category_correct[c])    / n,
-                "subcategory_accuracy": sum(per_cat_subcategory_correct[c]) / n,
-                "avg_rationale_score":  sum(per_cat_rationale_scores[c])    / n,
-                "n":                    n,
-            }
-        return result
+    all_vj  = [v for d in acc.values() for v in d["valid_json"]]
+    all_ac  = [v for d in acc.values() for v in d["action_correct"]]
+    all_cc  = [v for d in acc.values() for v in d["category_correct"]]
+    all_rs  = [v for d in acc.values() for v in d["rationale_scores"]]
+    n_total = len(all_vj)
 
-    return {"overall": build_overall(), "by_category": build_by_category()}
+    return {
+        "overall": {
+            "valid_json_rate":     sum(all_vj) / n_total,
+            "action_accuracy":     sum(all_ac) / n_total,
+            "category_accuracy":   sum(all_cc) / n_total,
+            "avg_rationale_score": sum(all_rs) / len(all_rs) if all_rs else None,
+            "n": n_total,
+        },
+        "by_category": {cat: agg(data) for cat, data in acc.items()},
+    }
 
 
-def print_results(split: str, results: dict) -> None:
+def print_split_results(split: str, results: dict) -> None:
     ov = results["overall"]
-    print(f"\n  [{split}] overall "
-          f"refusal={ov['refusal_rate']:.1%}  "
-          f"action_acc={ov['action_accuracy']:.1%}  "
-          f"cat_acc={ov['category_accuracy']:.1%}  "
-          f"valid_json={ov['valid_json_rate']:.1%}  "
-          f"rationale={ov['avg_rationale_score']:.2f}  "
-          + (f"over_refusal={ov.get('over_refusal_rate', 0):.1%}  " if split == "benign" else "")
-          + f"n={ov['n']}")
+    rat = f"{ov['avg_rationale_score']:.2f}" if ov["avg_rationale_score"] is not None else "N/A"
+    print(
+        f"\n  [{split}]"
+        f"  valid_json={ov['valid_json_rate']:.1%}"
+        f"  action_acc={ov['action_accuracy']:.1%}"
+        f"  category_acc={ov['category_accuracy']:.1%}"
+        f"  rationale={rat}"
+        f"  n={ov['n']}"
+    )
     for cat, m in results["by_category"].items():
-        print(f"    {cat:<25} action_acc={m['action_accuracy']:.1%}  "
-              f"refusal={m['refusal_rate']:.1%}  n={m['n']}")
+        print(
+            f"    {cat:<30}"
+            f"  action_acc={m['action_accuracy']:.1%}"
+            f"  valid_json={m['valid_json_rate']:.1%}"
+            f"  n={m['n']}"
+        )
 
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint",      default="base",
-                        help="Label for this eval run (base | sft | dpo)")
+                        help="Label: base | sft | dpo (used in output filename)")
     parser.add_argument("--checkpoint_name", default="",
-                        help="Tinker model_path for trained checkpoint (empty = base model)")
+                        help="Tinker model path (empty = base model)")
+    parser.add_argument("--skip_rationale",       action="store_true",
+                        help="Skip LLM rationale judge (faster, no avg_rationale_score)")
     parser.add_argument("--no_structured_prompt", action="store_true",
-                        help="Skip SYSTEM_PROMPT prefix (use for base model eval)")
+                        help="Use raw question only — no SYSTEM_PROMPT (for base_freeform run)")
     args = parser.parse_args()
-
-    # Base model evals use the raw question; trained checkpoints use the structured prompt
-    use_structured_prompt = not args.no_structured_prompt and args.checkpoint != "base"
 
     config = SFTConfig()
     sampling_client = await create_eval_sampling_client(
@@ -275,8 +233,7 @@ async def main():
         base_url="https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
         api_key=os.environ["TINKER_API_KEY"],
     )
-    rj_evaluator     = RJScoreEvaluator(judge_client, model=config.model_name)
-    schema_evaluator = SchemaEvaluator(judge_client,  model=config.model_name)
+    evaluator = SchemaEvaluator(judge_client, model=config.model_name)
 
     out_dir = Path("outputs")
     out_dir.mkdir(exist_ok=True)
@@ -289,19 +246,21 @@ async def main():
             print(f"\nEvaluating {split} split...")
             results[split] = await evaluate_split(
                 sampling_client, processor, tokenizer,
-                rj_evaluator, schema_evaluator,
-                split, config.categories, trace_file,
-                use_structured_prompt=use_structured_prompt,
+                evaluator, split, config.categories,
+                trace_file, args.skip_rationale,
+                no_structured_prompt=args.no_structured_prompt,
             )
-            print_results(split, results[split])
+            print_split_results(split, results[split])
 
     metrics_path.write_text(json.dumps({
-        "checkpoint": args.checkpoint,
-        "structured_prompt": use_structured_prompt,
-        "results": results,
+        "checkpoint":     args.checkpoint,
+        "skip_rationale": args.skip_rationale,
+        "results":        results,
     }, indent=2))
+
     print(f"\nTrace   → {trace_path}")
     print(f"Metrics → {metrics_path}")
+    print("\nRun scripts/compare_evals.py to print the full base→SFT→DPO table.")
 
 
 if __name__ == "__main__":
