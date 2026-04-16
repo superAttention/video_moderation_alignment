@@ -20,7 +20,11 @@ class SFTConfig:
     learning_rate: float = 1e-4
     num_epochs: int = 1
 
+    # Data loading
+    batch_size: int = 4
+
     # Logging / checkpointing
     log_path: str = "~/logs/sft"
+    log_every: int = 5       # steps between loss prints
     save_every: int = 20     # steps between checkpoint saves
     eval_every: int = 10     # steps between evaluations

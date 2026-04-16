@@ -12,6 +12,8 @@ Input JSONL format (one example per line):
         "refusal": "I'm sorry, I can't help with that."
     }
 """
+import json
+import numpy as np
 from tinker import types
 from .video_utils import extract_frames
 
@@ -21,32 +23,86 @@ class SFTDataset:
     Iterable dataset that yields batches of types.Datum for SFT training.
 
     Each Datum contains:
-      - model_input: video frames + tokenized (question + refusal)
-      - loss_fn_inputs: weights (0=question, 1=refusal) and target_tokens
+      - model_input: video frames + tokenized question (prompt tokens, length N)
+      - loss_fn_inputs:
+          target_tokens: full_ids[1:]  — the N next-token targets
+          weights:        0 on question positions, 1 on refusal positions
     """
 
     def __init__(self, data_path: str, tokenizer, processor, max_seq_len: int, num_frames: int = 8):
         """
         Args:
-            data_path:  path to JSONL file produced by scripts/generate_responses.py
-            tokenizer:  from training_client.get_tokenizer()
-            processor:  Qwen3-VL processor for combining vision + text tokens
-            num_frames: number of frames to sample per video
+            data_path:   path to JSONL file produced by scripts/generate_responses.py
+            tokenizer:   from training_client.get_tokenizer()
+            processor:   Qwen3-VL processor for combining vision + text tokens
+            max_seq_len: hard cap on sequence length (truncates refusal if needed)
+            num_frames:  number of frames to sample per video
         """
-        raise NotImplementedError
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.max_seq_len = max_seq_len
+        self.num_frames = num_frames
+
+        with open(data_path) as f:
+            self.examples = [json.loads(line) for line in f]
 
     def __len__(self) -> int:
-        raise NotImplementedError
+        return len(self.examples)
 
     def make_datum(self, question: str, video_path: str, refusal: str) -> types.Datum:
         """
-        1. Extract frames from video
-        2. Tokenize question + refusal via processor
-        3. Set weights: 0 on question tokens, 1 on refusal tokens
-        4. Return types.Datum
+        Build one types.Datum for cross-entropy SFT.
+
+        Steps:
+          1. Extract frames and tokenize the question (prompt)
+          2. Tokenize the refusal and append an EOS token
+          3. Build full_ids = prompt_ids + refusal_ids + [eos]
+          4. Compute token weights 
+          5. Return Datum with model_input=full_ids[:-1], target_tokens=full_ids[1:]
         """
-        raise NotImplementedError
+        frames = extract_frames(video_path, self.num_frames)
+
+        # Step 1: tokenize the question (with video frames) to get prompt token IDs
+        prompt_inputs = self.processor(
+            text=question,
+            images=frames,
+            return_tensors="pt",
+        )
+        prompt_ids = prompt_inputs["input_ids"][0].tolist()
+
+        # Step 2: tokenize only the refusal text (no special tokens — we add EOS manually)
+        refusal_ids = self.tokenizer.encode(refusal, add_special_tokens=False)
+        eos_id = self.tokenizer.eos_token_id
+
+        # Step 3: concatenate into one sequence, then truncate
+        full_ids = (prompt_ids + refusal_ids + [eos_id])[: self.max_seq_len + 1]
+        question_len = len(prompt_ids)        # number of prompt tokens
+        refusal_len  = len(full_ids) - question_len  # refusal + EOS (may be truncated)
+
+        # full_ids layout: [q0, q1, ..., q_{ql-1}, r0, r1, ..., r_{rl-1}, EOS]
+        # target_tokens   = full_ids[1:]  (length = len(full_ids) - 1)
+        # weights[i] should be 1 when target_tokens[i] is a refusal token (or EOS),
+        # and 0 when it is a question token.
+        weights = [0] * (question_len - 1) + [1] * refusal_len
+        target_tokens = full_ids[1:]
+
+        return types.Datum(
+            model_input=types.ModelInput.from_ints(full_ids[:-1]),
+            loss_fn_inputs={
+                "target_tokens": np.array(target_tokens, dtype=np.int32),
+                "weights":       np.array(weights,       dtype=np.float32),
+            },
+        )
 
     def batches(self, batch_size: int):
-        """Yield batches of types.Datum."""
-        raise NotImplementedError
+        """Yield list[types.Datum] batches over the full dataset."""
+        batch = []
+        for ex in self.examples:
+            batch.append(
+                self.make_datum(ex["question"], ex["video_path"], ex["refusal"])
+            )
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch

@@ -16,6 +16,16 @@ Where:
     π_ref = reference model (frozen)
     β   = KL penalty coefficient (config.beta)
 """
+
+"""
+Basically for a single prompt, in the dataset we have the good 
+good response and the bad response, we use the reference model and
+the current model to calculate the probability of getting the good response and the 
+bad response, by actively choosing the token that match the response
+and calculate the joint probability of getting that reponse.
+We try to maximise the difference between the probabilty of good response - the bad resopnse
+"""
+
 import torch
 import torch.nn.functional as F
 from tinker import TrainingClient, types
@@ -45,7 +55,7 @@ class DPOTrainer(BaseTrainer):
         Uses client.forward() — not forward_backward().
         Returns shape (B,).
         """
-        raise NotImplementedError
+
 
     def dpo_loss(
         self,

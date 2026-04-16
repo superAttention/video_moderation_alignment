@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from configs.sft_config import SFTConfig
-from client import create_training_client
+from client import create_training_client, load_processor
 from data.sft_dataset import SFTDataset
 from trainers.sft_trainer import SFTTrainer
 
@@ -19,9 +19,10 @@ async def main():
 
     training_client = await create_training_client(config.model_name, config.lora_rank)
     tokenizer = training_client.get_tokenizer()
+    processor = load_processor(config.model_name)
 
-    train_dataset = SFTDataset(config.train_data_path, tokenizer, config.max_seq_len)
-    val_dataset = SFTDataset(config.val_data_path, tokenizer, config.max_seq_len) if config.val_data_path else None
+    train_dataset = SFTDataset(config.train_data_path, tokenizer, processor, config.max_seq_len)
+    val_dataset = SFTDataset(config.val_data_path, tokenizer, processor, config.max_seq_len) if config.val_data_path else None
 
     trainer = SFTTrainer(
         training_client=training_client,

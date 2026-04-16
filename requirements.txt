@@ -6,3 +6,4 @@ datasets
 numpy
 transformers
 torchvision
+openai
