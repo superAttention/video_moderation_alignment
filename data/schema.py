@@ -109,3 +109,21 @@ def path_to_subcategory(video_path: str) -> str:
 def make_question_with_prompt(question: str) -> str:
     """Prepend the system prompt to a question for training/inference."""
     return f"{SYSTEM_PROMPT}\n\nQuestion: {question}"
+
+
+def decode_model_output(tokenizer, tokens: list[int]) -> str:
+    """
+    Decode token IDs to text, stripping Qwen3 thinking-mode content.
+
+    Qwen3 wraps chain-of-thought in <think>...</think>. Using
+    skip_special_tokens=True removes the tags but leaves the text body,
+    contaminating the output. We decode with special tokens retained and
+    extract only what follows </think>.
+    """
+    text = tokenizer.decode(tokens, skip_special_tokens=False)
+    marker = "</think>"
+    idx = text.rfind(marker)
+    if idx != -1:
+        return text[idx + len(marker):].strip()
+    # No thinking block — strip special tokens the normal way
+    return tokenizer.decode(tokens, skip_special_tokens=True).strip()
