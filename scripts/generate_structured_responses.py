@@ -159,7 +159,10 @@ async def main():
 
                 score_counts[int(score)] += 1
 
-                if score < args.min_score:
+                # Quality filter applies to benign only — harmful examples are always
+                # kept regardless of score because the base model's safety alignment
+                # prevents specific visual descriptions of harmful content.
+                if split == "benign" and score < args.min_score:
                     n_skipped += 1
                     skipped_examples.append({
                         "question_id": example["question_id"],

@@ -90,6 +90,8 @@ For each example in Video-SafetyBench (harmful + benign splits, 3 categories):
 
 The base model is told the correct action and asked to describe the visual content that justifies it — it does not make the classification decision itself.
 
+**Split-aware quality filter:** `--min_score 3.0` applies only to the **benign** split. The harmful split retains all best-of-5 rationales regardless of score. Reason: the base model's own safety alignment prevents it from describing harmful visual content in specific detail, so low-scoring rationales on the harmful split reflect a model constraint, not data quality. The action and category fields (deterministic ground truth) are still correct. SFT learns the REFUSE boundary from these examples; DPO refines rationale quality later.
+
 ### Data split (`split_data.py`)
 
 Stratified 80/10/10 split by `(category, split)` key — ensures all 6 strata are represented in every fold.
