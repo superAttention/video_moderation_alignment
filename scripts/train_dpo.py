@@ -30,13 +30,15 @@ async def main():
 
     config = DPOConfig()
 
-    # Policy client — weights will be updated
+    # Policy client — initialized from SFT, weights will be updated
     policy_client = await create_training_client(config.model_name, config.lora_rank)
 
-    # Reference client — same architecture, never call optim_step on this
+    # Reference client — frozen SFT model, never call optim_step on this
     ref_client = await create_training_client(config.model_name, config.lora_rank)
+
     if args.sft_checkpoint:
-        await ref_client.load_state_with_optimizer_async(args.sft_checkpoint)
+        await (await policy_client.load_state_async(args.sft_checkpoint))
+        await (await ref_client.load_state_async(args.sft_checkpoint))
 
     tokenizer = policy_client.get_tokenizer()
     processor = load_processor(config.model_name)

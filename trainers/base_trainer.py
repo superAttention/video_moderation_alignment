@@ -27,7 +27,7 @@ class BaseTrainer(ABC):
 
     async def save_checkpoint(self, tag: str = "") -> None:
         name = tag or f"step_{self.global_step}"
-        await self.tc.save_state(name=name)
+        await (await self.tc.save_weights_for_sampler_async(name=name))
 
     def log(self, metrics: dict) -> None:
         loss = metrics.get("loss:sum", metrics.get("loss", None))

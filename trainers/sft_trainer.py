@@ -30,8 +30,8 @@ class SFTTrainer(BaseTrainer):
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
 
             for batch in self.train_dataset.batches(self.config.batch_size):
-                output = await self.tc.forward_backward(batch, self.config.loss_fn)
-                await self.tc.optim_step(adam_params)
+                output = await (await self.tc.forward_backward_async(batch, self.config.loss_fn))
+                await (await self.tc.optim_step_async(adam_params))
                 self.global_step += 1
 
                 if self.global_step % self.config.log_every == 0:
@@ -55,7 +55,7 @@ class SFTTrainer(BaseTrainer):
         n_batches = 0
 
         for batch in self.val_dataset.batches(self.config.batch_size):
-            output = await self.tc.forward(batch, self.config.loss_fn)
+            output = await (await self.tc.forward_async(batch, self.config.loss_fn))
             # Tinker reports loss as "loss:sum" — divide by batch size for per-example loss
             batch_loss = output.metrics.get("loss:sum", 0.0) / len(batch)
             total_loss += batch_loss
